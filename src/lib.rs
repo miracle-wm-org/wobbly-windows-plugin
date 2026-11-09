@@ -8,12 +8,17 @@
 //! watches where the built-in animation puts the window each frame
 //! ([`AnimationFrameData::builtin`]) and returns `None` so the frame is left to it.
 //!
-//! The wobble itself is a damped spring. A virtual point is pulled toward the
-//! window's position; how far it lags behind (the "lag") is sent to a geometry
-//! shader, which subdivides the window and displaces each vertex by the lag,
-//! weighted from nothing at the window's center to all of it at the corners. The
-//! spring keeps ticking after the move ends (via a custom animation) until it
-//! comes to rest, then the shader is detached.
+//! The wobble itself is a pair of damped springs: one follows the window's
+//! top-left corner and the other its bottom-right corner. Each spring pulls a
+//! virtual point toward its corner; how far the point lags behind (the "lag") is
+//! sent to a geometry shader, which subdivides the window and displaces each
+//! vertex by a blend of the two lags (the top-left lag on the left/top edges, the
+//! bottom-right lag on the right/bottom edges), weighted from nothing at the
+//! window's center to all of it at the corners. Following both corners means a
+//! window that is only resized (say, the left of two side-by-side windows, whose
+//! top-left corner stays put) still wobbles along the edge that moves. The
+//! springs keep ticking after the move ends (via a custom animation) until they
+//! come to rest, then the shader is detached.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -47,9 +52,12 @@ const MAX_FRAME: f32 = 1.0 / 30.0;
 const MAX_WOBBLE_SECONDS: f32 = 10.0;
 
 /// Subdivides each incoming triangle into an 8x8 grid so that the window can bend,
-/// and displaces every vertex by the lag in `u_lag`, weighted by its
-/// distance from the window's center. The weight only depends on `v_local`, so the
-/// window's content and its border bend identically.
+/// and displaces every vertex by the lag of the corners: `u_lag_lo` (top-left)
+/// and `u_lag_hi` (bottom-right), blended per axis by the vertex's position across
+/// the window and weighted by its distance from the window's center. When the
+/// window only moves, both lags are equal and the window trails as one piece; when
+/// it is resized, only the moving edge trails. Everything only depends on
+/// `v_local`, so the window's content and its border bend identically.
 ///
 /// Each of the 8 rows is emitted as one strip of 2 * (8 - row) + 1 vertices, which
 /// is 80 vertices in all.
@@ -65,7 +73,8 @@ in vec4 v_world[];
 out vec2 g_texcoord;
 
 uniform mat4 u_world_to_clip;
-uniform vec2 u_lag;
+uniform vec2 u_lag_lo;
+uniform vec2 u_lag_hi;
 
 const int N = 8;
 
@@ -78,7 +87,7 @@ void emit(float a, float b) {
     // 0 at the center of the window, 1 at its corners.
     vec2 centered = local * 2.0 - 1.0;
     float weight = 0.5 * dot(centered, centered);
-    world.xy += u_lag * weight;
+    world.xy += mix(u_lag_lo, u_lag_hi, local) * weight;
 
     gl_Position = u_world_to_clip * world;
     g_texcoord = c * v_texcoord[0] + a * v_texcoord[1] + b * v_texcoord[2];
@@ -100,35 +109,24 @@ void main() {
 }
 "#;
 
-/// The damped spring behind one window's wobble.
+/// A damped spring whose virtual point trails one corner of a window.
 struct Spring {
-    window: Window,
-    /// The custom animation that ticks this spring.
-    animation_id: u32,
-    /// Whether the geometry shader has been attached to the window yet.
-    attached: bool,
-    /// The virtual point that trails the window, and its velocity.
+    /// The virtual point that trails the corner, and its velocity.
     position: Vec2,
     velocity: Vec2,
-    /// Where the window is, as last reported by the move animation.
+    /// Where the corner is, as last reported by the move animation.
     target: Vec2,
-    /// [target] as of the previous tick, to tell whether the window is still moving.
+    /// [target] as of the previous tick, to tell whether the corner is still moving.
     previous_target: Vec2,
-    max_lag: f32,
 }
 
 impl Spring {
-    fn new(window: Window, animation_id: u32, target: Vec2) -> Self {
-        let smaller_side = window.size.width.min(window.size.height) as f32;
+    fn new(target: Vec2) -> Self {
         Self {
-            window,
-            animation_id,
-            attached: false,
             position: target,
             velocity: Vec2::ZERO,
             target,
             previous_target: target,
-            max_lag: MAX_LAG.min(smaller_side * MAX_LAG_FRACTION),
         }
     }
 
@@ -136,8 +134,8 @@ impl Spring {
         self.position - self.target
     }
 
-    /// Advances the spring by `dt` seconds.
-    fn step(&mut self, dt: f32) {
+    /// Advances the spring by `dt` seconds, keeping its lag within `max_lag`.
+    fn step(&mut self, dt: f32, max_lag: f32) {
         let mut remaining = dt.min(MAX_FRAME);
         while remaining > 0.0 {
             let h = remaining.min(STEP);
@@ -150,8 +148,8 @@ impl Spring {
 
         // Clamp the lag so that very fast moves do not turn the window inside out.
         let lag = self.lag();
-        if lag.length() > self.max_lag {
-            self.position = self.target + lag.normalize() * self.max_lag;
+        if lag.length() > max_lag {
+            self.position = self.target + lag.normalize() * max_lag;
         }
     }
 
@@ -162,11 +160,58 @@ impl Spring {
     }
 }
 
+/// The two springs behind one window's wobble.
+struct Wobble {
+    window: Window,
+    /// The custom animation that ticks the springs.
+    animation_id: u32,
+    /// Whether the geometry shader has been attached to the window yet.
+    attached: bool,
+    /// Trails the window's top-left corner.
+    lo: Spring,
+    /// Trails the window's bottom-right corner.
+    hi: Spring,
+    max_lag: f32,
+}
+
+impl Wobble {
+    fn new(window: Window, animation_id: u32, (lo, hi): (Vec2, Vec2)) -> Self {
+        let smaller_side = window.size.width.min(window.size.height) as f32;
+        Self {
+            window,
+            animation_id,
+            attached: false,
+            lo: Spring::new(lo),
+            hi: Spring::new(hi),
+            max_lag: MAX_LAG.min(smaller_side * MAX_LAG_FRACTION),
+        }
+    }
+
+    fn set_target(&mut self, (lo, hi): (Vec2, Vec2)) {
+        self.lo.target = lo;
+        self.hi.target = hi;
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.lo.step(dt, self.max_lag);
+        self.hi.step(dt, self.max_lag);
+    }
+
+    fn is_at_rest(&self) -> bool {
+        self.lo.is_at_rest() && self.hi.is_at_rest()
+    }
+
+    fn end_tick(&mut self) {
+        self.lo.previous_target = self.lo.target;
+        self.hi.previous_target = self.hi.target;
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// The registered geometry shader; `Some(None)` if registration failed.
     shader: Option<Option<u8>>,
-    springs: HashMap<u64, Spring>,
+    wobbles: HashMap<u64, Wobble>,
 }
 
 impl State {
@@ -176,23 +221,23 @@ impl State {
             .get_or_insert_with(|| register_window_geometry_shader(WOBBLE_GEOMETRY_SHADER))
     }
 
-    /// Detaches the wobble from `window_id` and stops ticking its spring.
+    /// Detaches the wobble from `window_id` and stops ticking its springs.
     fn stop(&mut self, window_id: u64) {
-        if let Some(spring) = self.springs.remove(&window_id) {
-            let _ = spring.window.clear_shader_uniform(None);
-            let _ = spring.window.set_geometry_shader(None);
-            let _ = cancel_custom_animation(spring.animation_id);
+        if let Some(wobble) = self.wobbles.remove(&window_id) {
+            let _ = wobble.window.clear_shader_uniform(None);
+            let _ = wobble.window.set_geometry_shader(None);
+            let _ = cancel_custom_animation(wobble.animation_id);
         }
     }
 }
 
 thread_local! {
     // Plugins run single-threaded inside the WASM sandbox. The custom animation
-    // callbacks are `'static`, so the springs live here rather than on the plugin.
+    // callbacks are `'static`, so the wobbles live here rather than on the plugin.
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
-/// Ticks the spring of `window_id`; called every frame by its custom animation.
+/// Ticks the springs of `window_id`; called every frame by its custom animation.
 fn tick(window_id: u64, dt: f32, elapsed_seconds: f32) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -200,27 +245,31 @@ fn tick(window_id: u64, dt: f32, elapsed_seconds: f32) {
             state.stop(window_id);
             return;
         };
-        let Some(spring) = state.springs.get_mut(&window_id) else {
+        let Some(wobble) = state.wobbles.get_mut(&window_id) else {
             return;
         };
 
         // Host calls that act on the window are made here rather than in the move
         // hook, as this runs on the window manager's thread.
-        if !spring.attached {
-            spring.attached = spring.window.set_geometry_shader(Some(shader)).is_ok();
+        if !wobble.attached {
+            wobble.attached = wobble.window.set_geometry_shader(Some(shader)).is_ok();
         }
 
-        spring.step(dt);
-        if spring.is_at_rest() || elapsed_seconds >= MAX_WOBBLE_SECONDS {
+        wobble.step(dt);
+        if wobble.is_at_rest() || elapsed_seconds >= MAX_WOBBLE_SECONDS {
             state.stop(window_id);
             return;
         }
 
-        spring.previous_target = spring.target;
-        let lag = spring.lag();
-        let _ = spring
+        wobble.end_tick();
+        let lo = wobble.lo.lag();
+        let hi = wobble.hi.lag();
+        let _ = wobble
             .window
-            .set_shader_uniform("u_lag", ShaderUniform::Vec2([lag.x, lag.y]));
+            .set_shader_uniform("u_lag_lo", ShaderUniform::Vec2([lo.x, lo.y]));
+        let _ = wobble
+            .window
+            .set_shader_uniform("u_lag_hi", ShaderUniform::Vec2([hi.x, hi.y]));
     });
 }
 
@@ -233,22 +282,27 @@ impl Plugin for WobblyWindows {
         data: &AnimationFrameData,
         window: &Window,
     ) -> Option<AnimationFrameResult> {
-        // Follow wherever the built-in animation puts the window this frame.
+        // Follow wherever the built-in animation puts the window this frame. The
+        // clip area is what is actually shown: while the window grows, its area
+        // already has the final size and only the clip area grows with it.
         let builtin = data.builtin?;
         let rect = if builtin.completed {
             data.destination
         } else {
-            builtin.area.or(builtin.clip_area)?
+            builtin.clip_area.or(builtin.area)?
         };
-        let target = Vec2::new(rect.x, rect.y);
+        let target = (
+            Vec2::new(rect.x, rect.y),
+            Vec2::new(rect.x + rect.width, rect.y + rect.height),
+        );
 
         STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.shader()?;
 
             let window_id = window.id();
-            if let Some(spring) = state.springs.get_mut(&window_id) {
-                spring.target = target;
+            if let Some(wobble) = state.wobbles.get_mut(&window_id) {
+                wobble.set_target(target);
                 return Some(());
             }
 
@@ -257,8 +311,8 @@ impl Plugin for WobblyWindows {
                 MAX_WOBBLE_SECONDS + 1.0,
             )?;
             state
-                .springs
-                .insert(window_id, Spring::new(window.clone(), animation_id, target));
+                .wobbles
+                .insert(window_id, Wobble::new(window.clone(), animation_id, target));
             Some(())
         });
 
