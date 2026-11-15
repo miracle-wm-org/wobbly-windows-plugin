@@ -10,5 +10,5 @@ description = "Wobbly windows for miracle-wm: windows wobble as they slide, then
 crate-type = ["cdylib"]
 
 [dependencies]
-glam = "0.29"
+glam = "0.34"
 miracle-plugin = "0.3.0"
